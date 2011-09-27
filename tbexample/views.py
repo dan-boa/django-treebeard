@@ -142,4 +142,5 @@ def convo(request, treetype, node_id=None):
 def choose(request):
     return render_to_response('tbexample/choose.html', {})
 
-
+def hello(request):
+    print "Hello world"
