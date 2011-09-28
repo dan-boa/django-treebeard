@@ -21,6 +21,7 @@ root_dir = os.path.dirname(__file__)
 if not root_dir:
     root_dir = '.'
 long_desc = open(root_dir + '/README').read()
+print __file__
 
 setup(
     name='django-treebeard',
@@ -36,3 +37,4 @@ setup(
     classifiers=classifiers,
     long_description=long_desc,
 )
+
