@@ -116,6 +116,7 @@ class NS_Node(Node):
         newobj.tree_id = newtree_id
         newobj.lft = 1
         newobj.rgt = 2
+        newobj.parent = 0
         # saving the instance before returning it
         newobj.save()
         transaction.commit_unless_managed()
@@ -141,6 +142,7 @@ class NS_Node(Node):
                   'tree_id': tree_id,
                   'lftop': lftop,
                   'incdec': incdec}
+        #print sql
         return sql, []
 
     @classmethod
@@ -174,7 +176,6 @@ class NS_Node(Node):
         newobj.depth = self.depth + 1
         newobj.lft = self.lft + 1
         newobj.rgt = self.lft + 2
-
         # this is just to update the cache
         self.rgt = self.rgt + 2
 
@@ -270,7 +271,7 @@ class NS_Node(Node):
                 sql, params = move_right(target.tree_id, newpos, True, 2)
 
             newobj.lft = newpos
-            newobj.rgt = newpos + 1
+            newobj.rgt = newpos +1
 
         # saving the instance before returning it
         if sql:
@@ -602,6 +603,148 @@ class NS_Node(Node):
         ":returns: A queryset containing the root nodes in the tree."
         return cls.objects.filter(lft=1)
 
+
     class Meta:
         "Abstract model."
         abstract = True
+
+    @classmethod
+    def find_problems(cls,tree_id=1) :
+        """
+        Fix the following problems in a nested set
+        Return the tuple of list where the first element is a 
+        list with error in left and the second element contaning
+        error in right
+        """
+        root = cls.objects.filter(lft=1, tree_id=tree_id)[0]
+        s = Stack()
+        s.push(root)
+        l_dict = {}
+        r_dict = {}
+        int_dict = {}
+
+        while not s.empty():
+            #print s.counter
+            element = s.peek() 
+            #print element.ns_node.id
+            if element.lft_v:
+                element = s.pop()
+                if not element.ns_node.rgt == s.counter:
+                    if l_dict.has_key(element.ns_node.guid):
+                        int_dict[element.ns_node.guid] = { 'name': element.ns_node.name, 'lft': l_dict.pop(element.ns_node.guid)['lft'], 'rgt': s.counter }
+                    else:
+                        r_dict[element.ns_node.guid] = {'name': element.ns_node.name, 'rgt': s.counter}
+            else:
+                s.visited()
+                if not element.ns_node.lft == s.counter:
+                    l_dict[element.ns_node.guid] = {'name': element.ns_node.name, 'lft': s.counter }
+            
+                list_of_child = element.ns_node.get_sanitized_children()
+            
+                if list_of_child is not None:
+                    for n_node in list_of_child:
+                        s.push(n_node)
+
+        error_tuple = (l_dict, r_dict, int_dict, len(l_dict), len(r_dict), len(int_dict))
+        return error_tuple
+            
+    def get_sanitized_children(self):
+        """
+        Get the immediate children using the parent id
+        """
+        return self.__class__.objects.filter(referedby=self.guid).order_by('-id')
+
+    def get_sanitized_descandants(self):
+        """
+        Get the count of descandants using the parent id
+        """
+        sum = 1
+        for child in self.get_sanitized_children():
+            sum = sum + child.get_sanitized_descandants()
+        return sum
+    
+    def get_sanitized_rgt(self):
+        """
+        Use the formula rgt = lft + 1 + 2*( get_sanitized_descandants )
+        """
+        return self.lft + 1 + 2*(self.get_sanitized_descandants()-1)
+    
+    @classmethod    
+    def fix_problems(cls):
+
+        l_dict, r_dict, int_dict, l_count, r_count, int_count = cls.find_problems()
+        for k, v in l_dict.items():
+            sql, params = cls._update_lft_sql(k, v['lft'])
+            #print sql
+            connection.cursor().execute(sql, [])
+        for k, v in r_dict.items():
+            sql, params = cls._update_rgt_sql(k, v['rgt'])
+            print sql
+            connection.cursor().execute(sql, [])
+        for k, v in int_dict.items():
+            sql, params = cls._update_int_sql(k, v['lft'], v['rgt'])
+            print sql
+            connection.cursor().execute(sql, [])
+
+            transaction.commit_unless_managed()
+        
+    
+    @classmethod
+    def _update_int_sql(cls, node_id, lft_id, rgt_id):
+        sql = "UPDATE %(table)s SET lft = %(lft_id)d , rgt = %(rgt_id)d WHERE guid = '%(node_id)s' " % { 'table': connection.ops.quote_name(cls._meta.db_table), 'node_id': node_id, 'lft_id': lft_id, 'rgt_id': rgt_id }
+        return sql, []
+
+    @classmethod
+    def _update_rgt_sql(cls, node_id, rgt_id):
+        sql = "UPDATE %(table)s SET rgt = %(rgt_id)d WHERE guid = '%(node_id)s' " % { 'table': connection.ops.quote_name(cls._meta.db_table), 'node_id': node_id, 'rgt_id': rgt_id }
+        return sql, []
+
+    @classmethod
+    def _update_lft_sql(cls, node_id, lft_id):
+        sql = "UPDATE %(table)s SET lft = %(lft_id)d WHERE guid = '%(node_id)s' " % { 'table': connection.ops.quote_name(cls._meta.db_table), 'node_id': node_id, 'lft_id': lft_id }
+        return sql, []
+
+class Stack:
+
+    def __init__(self):
+        self.head = None
+        self.counter = 0
+
+    def push(self, ns_node):
+        print "Pushing  = " + str(ns_node.id)
+        self.head = Element(ns_node, self.head)
+
+    def pop(self):
+        if self.empty(): raise EmptyStackException
+        print "Popping  = " + str(self.head.ns_node.id)
+        self.counter+=1
+        result = self.head
+        self.head = self.head.next
+        return result
+
+    def peek(self):
+        if self.empty(): raise EmptyStackException
+        print "Peeking  = " + str(self.head.ns_node.id)
+        if not self.head.lft_v:
+            self.counter+=1
+        return self.head
+  
+    def visited(self):
+        self.head.lft_v = True
+
+    def empty(self):
+        return self.head == None
+
+
+class EmptyStackException(Exception):
+    pass
+
+
+class Element:
+
+    def __init__(self, ns_node, next):
+        self.ns_node = ns_node
+        self.lft_v = False
+        self.rgt_v = False
+        self.next = next
+
