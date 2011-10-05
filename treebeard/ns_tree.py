@@ -8,7 +8,7 @@ from django.db import models, transaction, connection
 
 from treebeard.models import Node
 from treebeard.exceptions import InvalidMoveToDescendant
-
+import pdb
 
 class NS_NodeQuerySet(models.query.QuerySet):
     """
@@ -65,9 +65,21 @@ class NS_NodeQuerySet(models.query.QuerySet):
                                 Q(tree_id=node.tree_id))
                 ranges.append((node.tree_id, node.lft, node.rgt))
             if toremove:
-                self.model.bjects.filter(
+                self.model.objects.filter(
                     reduce(operator.or_, toremove)).delete(
                     removed_ranges=ranges)
+
+            # updating the parent of the node to be deleted.
+            '''
+            parent_node =   super(NS_NodeQuerySet, self)
+            print type(parent_node)
+            if parent_node is not None:
+                child_order_list = (parent_node.child_order.split(":")).remove(str(self.id))
+                child_order = ":".join(child_order_list)
+                sql, params = self.__class__._update_child_order_sql(self.id, str(child_order))
+                print sql
+            connection.cursor().execute(sql, [])
+            '''
         transaction.commit_unless_managed()
 
 
@@ -89,6 +101,7 @@ class NS_Node(Node):
     tree_id = models.PositiveIntegerField(db_index=True)
     depth = models.PositiveIntegerField(db_index=True)
     parent = models.PositiveIntegerField(db_index=True)
+    child_order = models.CharField(max_length=100)    
 
     objects = NS_NodeManager()
 
@@ -118,6 +131,7 @@ class NS_Node(Node):
         newobj.lft = 1
         newobj.rgt = 2
         newobj.parent = 0
+        newobj.child_order = ""
         # saving the instance before returning it
         newobj.save()
         transaction.commit_unless_managed()
@@ -165,7 +179,8 @@ class NS_Node(Node):
                 pos = 'last-sibling'
             last_child = self.get_last_child()
             last_child._cached_parent_obj = self
-            return last_child.add_sibling(pos, **kwargs)
+            added_sibling = last_child.add_sibling(pos, **kwargs)
+            return added_sibling
 
         # we're adding the first child of this node
         sql, params = self.__class__._move_right(self.tree_id,
@@ -178,6 +193,7 @@ class NS_Node(Node):
         newobj.lft = self.lft + 1
         newobj.rgt = self.lft + 2
         newobj.parent = self.id
+        newobj.child_order = ""
         # this is just to update the cache
         self.rgt = self.rgt + 2
 
@@ -189,12 +205,14 @@ class NS_Node(Node):
         # saving the instance before returning it
         newobj.save()
         transaction.commit_unless_managed()
-
+        
+        # updating the child order of the parent
+        self.update_child_order(newobj.id)
         return newobj
 
     def add_sibling(self, pos=None, **kwargs):
         "Adds a new node as a sibling to the current node object."
-
+        original_pos = pos
         pos = self._fix_add_sibling_opts(pos)
 
         # creating a new object
@@ -204,6 +222,7 @@ class NS_Node(Node):
 
         sql = None
         target = self
+        #pdb.set_trace()
 
         if target.is_root():
             newobj.lft = 1
@@ -283,6 +302,9 @@ class NS_Node(Node):
         newobj.save()
 
         transaction.commit_unless_managed()
+
+        # updating the child order of the parent of the sibling
+        self.update_parent_child_order(newobj.id, original_pos)
 
         return newobj
 
@@ -611,6 +633,53 @@ class NS_Node(Node):
         "Abstract model."
         abstract = True
 
+    def update_parent_child_order(self, added_node_id, pos="sorted-sibling"):
+        """
+        Parent's child order is updated, called by one of its child
+        """
+        parent_node = self.get_parent()
+        child_order = None
+        if parent_node is None:
+            return
+
+        if pos == "first-sibling":
+            child_order_list = parent_node.child_order.split(":")
+            child_order_list = [str(added_node_id)] + child_order_list[:]
+            child_order_list = [ele for ele in child_order_list if ele!='']
+        elif pos == "left":
+            child_order_list = parent_node.child_order.split(":")
+            child_order_list = child_order_list[:child_order_list.index(str(self.id))]+[str(added_node_id)]+child_order_list[child_order_list.index(str(self.id)):]
+        elif pos == "right":
+            child_order_list = parent_node.child_order.split(":")
+            child_order_list = child_order_list[:child_order_list.index(str(self.id))+1]+[str(added_node_id)]+child_order_list[child_order_list.index(str(self.id))+1:]
+        elif pos == "last-sibling" or pos == "sorted-sibling":
+            child_order_list = parent_node.child_order.split(":")
+            child_order_list.append(str(added_node_id))
+            child_order_list = [ele for ele in child_order_list if ele!='']
+        else:
+            print "Unabe to determine the pos = " + pos
+            return 
+        
+        child_order = ":".join(child_order_list)
+        sql, params = self.__class__._update_child_order_sql(parent_node.id, str(child_order))
+        #print sql
+        connection.cursor().execute(sql, [])
+        transaction.commit_unless_managed()
+
+    def update_child_order(self, added_node_id, pos="sorted-sibling"):
+        """
+        Parent updates its child_order by calling itself
+        """
+        child_order_list = self.child_order.split(":")
+        child_order_list.append(str(added_node_id))
+        a_list = [ele for ele in child_order_list if ele!='']
+        child_order = ":".join(a_list)
+
+        sql, params = self.__class__._update_child_order_sql(self.id, str(child_order))
+        print sql
+        connection.cursor().execute(sql, [])
+        transaction.commit_unless_managed()
+
     @classmethod
     def find_problems(cls) :
         """
@@ -655,7 +724,21 @@ class NS_Node(Node):
         """
         Get the immediate children using the parent id
         """
-        return self.__class__.objects.filter(parent=self.id).order_by('-id')
+        list_child = self.__class__.objects.filter(parent=self.id)
+        if list_child:
+            dict_child = {}
+            sorted_list = []
+            for child in list_child:
+                dict_child[str(child.id)] = child
+            child_order_list = self.child_order.split(":")
+            child_order_list.reverse()
+            for child_order in child_order_list:
+                sorted_child = dict_child[child_order]
+                sorted_list.append(sorted_child)
+        else:
+            sorted_list = None
+        return sorted_list
+        #return self.__class__.objects.filter(parent=self.id).order_by('-id')
     
     @classmethod    
     def fix_problem(cls):
@@ -673,7 +756,6 @@ class NS_Node(Node):
             sql, params = cls._update_int_sql(int(k), v['lft'], v['rgt'])
             #print sql
             connection.cursor().execute(sql, [])
-
             transaction.commit_unless_managed()
         
     
@@ -690,6 +772,12 @@ class NS_Node(Node):
     @classmethod
     def _update_lft_sql(cls, node_id, lft_id):
         sql = "UPDATE %(table)s SET lft = %(lft_id)d WHERE id = %(id)d " % { 'table': connection.ops.quote_name(cls._meta.db_table), 'id': node_id, 'lft_id': lft_id }
+        return sql, []
+
+    @classmethod
+    def _update_child_order_sql(cls, node_id, child_order):
+        print child_order
+        sql = "UPDATE %(table)s SET child_order = '%(child_order)s' WHERE id = %(id)d " % { 'table': connection.ops.quote_name(cls._meta.db_table), 'id': node_id, 'child_order': child_order }
         return sql, []
 
 class Stack:
@@ -732,4 +820,3 @@ class Element:
         self.lft_v = False
         self.rgt_v = False
         self.next = next
-
